@@ -1,0 +1,38 @@
+workflows:
+  unity-ios-build:
+    name: Build and Publish iOS from Unity-generated Xcode project
+    environment:
+      xcode: latest
+      cocoapods: default
+      vars:
+        XCODE_PROJECT_PATH: "MyUnityiOSApp/MyUnityiOSApp.xcodeproj"
+        XCODE_SCHEME: "Unity-iPhone"
+    scripts:
+      - name: Install CocoaPods dependencies (optional)
+        script: |
+          cd $CM_BUILD_DIR/MyUnityiOSApp
+          pod install || echo "No Podfile found, skipping"
+
+      - name: Build Xcode project
+        script: |
+          xcodebuild clean -project "$XCODE_PROJECT_PATH" -scheme "$XCODE_SCHEME" -configuration Release
+          xcodebuild archive -project "$XCODE_PROJECT_PATH" \
+            -scheme "$XCODE_SCHEME" \
+            -archivePath "$CM_BUILD_DIR/build/MyUnityApp.xcarchive" \
+            -configuration Release \
+            -destination "generic/platform=iOS"
+
+      - name: Export IPA
+        script: |
+          xcodebuild -exportArchive \
+            -archivePath "$CM_BUILD_DIR/build/MyUnityApp.xcarchive" \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath "$CM_BUILD_DIR/build/ipa"
+
+    artifacts:
+      - build/ipa/*.ipa
+
+    publishing:
+      app_store_connect:
+        apple_id: $APP_STORE_ID
+        app_specific_password: $APP_STORE_PASSWORD
