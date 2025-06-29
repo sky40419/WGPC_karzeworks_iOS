@@ -1,0 +1,628 @@
+#include "il2cpp-config.h"
+#include "il2cpp-object-internals.h"
+#include "il2cpp-class-internals.h"
+#include "il2cpp-tabledefs.h"
+#include "gc/GCHandle.h"
+#include "metadata/GenericMetadata.h"
+#include "vm/Exception.h"
+#include "vm/Field.h"
+#include "vm/GenericClass.h"
+#include "vm/MetadataCache.h"
+#include "vm/Object.h"
+#include "vm/PlatformInvoke.h"
+#include "vm/RCW.h"
+#include "vm/Runtime.h"
+#include "os/Atomic.h"
+#include "os/COM.h"
+#include "vm/Monitor.h"
+#include "os/Mutex.h"
+#include "os/WindowsRuntime.h"
+#include "utils/Il2CppError.h"
+#include "utils/Il2CppHashMap.h"
+#include "utils/HashUtils.h"
+#include "utils/StringUtils.h"
+
+#include "Baselib.h"
+#include "Cpp/ReentrantLock.h"
+
+const Il2CppGuid Il2CppIUnknown::IID = { 0x00000000, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+const Il2CppGuid Il2CppISequentialStream::IID = { 0x0c733a30, 0x2a1c, 0x11ce, 0xad, 0xe5, 0x00, 0xaa, 0x00, 0x44, 0x77, 0x3d };
+const Il2CppGuid Il2CppIStream::IID = { 0x0000000c, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+const Il2CppGuid Il2CppIMarshal::IID = { 0x00000003, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+const Il2CppGuid Il2CppIManagedObject::IID = { 0xc3fcc19e, 0xa970, 0x11d2, 0x8b, 0x5a, 0x00, 0xa0, 0xc9, 0xb7, 0xc9, 0xc4 };
+const Il2CppGuid Il2CppIManagedObjectHolder::IID = { 0xd4bbc1c8, 0xf5bf, 0x4647, 0x94, 0x95, 0x2e, 0x5c, 0xf, 0x20, 0xf7, 0x5d };
+const Il2CppGuid Il2CppIInspectable::IID = { 0xaf86e2e0, 0xb12d, 0x4c6a, 0x9c, 0x5a, 0xd7, 0xaa, 0x65, 0x10, 0x1E, 0x90 };
+const Il2CppGuid Il2CppIActivationFactory::IID = { 0x00000035, 0x0000, 0x0000, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+const Il2CppGuid Il2CppIRestrictedErrorInfo::IID = { 0x82ba7092, 0x4c88, 0x427d, 0xa7, 0xbc, 0x16, 0xdd, 0x93, 0xfe, 0xb6, 0x7e };
+const Il2CppGuid Il2CppILanguageExceptionErrorInfo::IID = { 0x04a2dbf3, 0xdf83, 0x116c, 0x09, 0x46, 0x08, 0x12, 0xab, 0xf6, 0xe0, 0x7d };
+const Il2CppGuid Il2CppIAgileObject::IID = { 0x94ea2b94, 0xe9cc, 0x49e0, 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 };
+const Il2CppGuid Il2CppIWeakReference::IID = { 0x00000037, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+const Il2CppGuid Il2CppIWeakReferenceSource::IID = { 0x00000038, 0x0000, 0x0000, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 };
+
+namespace il2cpp
+{
+namespace vm
+{
+    typedef Il2CppHashMap<Il2CppIUnknown*, /* Weak GC Handle */ Il2CppGCHandle, il2cpp::utils::PointerHash<Il2CppIUnknown> > RCWCache;
+
+    static baselib::ReentrantLock s_RCWCacheMutex;
+    static RCWCache s_RCWCache;
+
+    void RCW::Register(Il2CppComObject* rcw)
+    {
+        os::FastAutoLock lock(&s_RCWCacheMutex);
+        rcw->refCount = 1;
+        auto weakRef = gc::GCHandle::NewWeakref(rcw, false);
+        vm::Exception::RaiseIfError(weakRef.GetError());
+        const bool inserted = s_RCWCache.insert(std::make_pair(rcw->identity, weakRef.Get())).second;
+        Assert(inserted);
+    }
+
+    static inline Il2CppIUnknown* GetIdentity(Il2CppIUnknown* unknown)
+    {
+        Il2CppIUnknown* identity;
+        il2cpp_hresult_t hr = unknown->QueryInterface(Il2CppIUnknown::IID, reinterpret_cast<void**>(&identity));
+        vm::Exception::RaiseIfFailed(hr, true);
+        IL2CPP_ASSERT(identity);
+
+        return identity;
+    }
+
+// Shameless comment copycat from .NET Native (https://github.com/dotnet/corert/blob/374c3d47992a7c444ec7d1dfe94b1780de942a55/src/System.Private.Interop/src/Shared/McgComHelpers.cs#L557):
+// 1. Prefer using the class returned from GetRuntimeClassName
+// 2. Otherwise use the class (if there) in the signature
+// 3. Out of options - create Il2CppComObject
+    static inline Il2CppClass* GetClassForRCW(Il2CppIInspectable* inspectable, Il2CppClass* fallbackClass)
+    {
+        Il2CppHString className;
+        il2cpp_hresult_t hr = inspectable->GetRuntimeClassName(&className);
+        if (IL2CPP_HR_FAILED(hr) || className == NULL)
+            return fallbackClass;
+
+        uint32_t classNameLength;
+        auto classNamePtr = os::WindowsRuntime::GetHStringBuffer(className, &classNameLength);
+        vm::Exception::RaiseIfError(classNamePtr.GetError());
+        std::string classNameUtf8 = utils::StringUtils::Utf16ToUtf8(classNamePtr.Get(), classNameLength);
+        os::WindowsRuntime::DeleteHString(className);
+
+        Il2CppClass* rcwClass = MetadataCache::GetWindowsRuntimeClass(classNameUtf8.c_str());
+        return rcwClass != NULL ? rcwClass : fallbackClass;
+    }
+
+    static inline Il2CppClass* GetClassForRCW(Il2CppIUnknown* unknown, Il2CppClass* fallbackClass)
+    {
+        Il2CppIInspectable* inspectable;
+        il2cpp_hresult_t hr = unknown->QueryInterface(Il2CppIInspectable::IID, reinterpret_cast<void**>(&inspectable));
+
+        if (IL2CPP_HR_FAILED(hr))
+            return fallbackClass;
+
+        Il2CppClass* result = GetClassForRCW(inspectable, fallbackClass);
+        inspectable->Release();
+        return result;
+    }
+
+    Il2CppObject* ReboxIReference(Il2CppIUnknown* comObject, Il2CppClass* objectClass);
+    Il2CppObject* ReboxKeyValuePair(Il2CppIUnknown* comObject, Il2CppClass* keyValuePairGenericInstance);
+    Il2CppObject* ReboxUri(Il2CppIUnknown* comObject);
+
+    Il2CppObject* ReboxIfBoxed(Il2CppIUnknown* comObject, Il2CppClass* objectClass)
+    {
+        if (strcmp(objectClass->namespaze, "Windows.Foundation") == 0)
+        {
+            if (strcmp(objectClass->name, "IReference`1") == 0 || strcmp(objectClass->name, "IReferenceArray`1") == 0)
+                return ReboxIReference(comObject, objectClass);
+        }
+        else if (strcmp(objectClass->namespaze, "System.Collections.Generic") == 0 && strcmp(objectClass->name, "KeyValuePair`2") == 0)
+        {
+            return ReboxKeyValuePair(comObject, objectClass);
+        }
+        else if (objectClass == il2cpp_defaults.system_uri_class)
+        {
+            return ReboxUri(comObject);
+        }
+
+        return NULL;
+    }
+
+    Il2CppObject* ReboxIReference(Il2CppIUnknown* comObject, Il2CppClass* objectClass)
+    {
+        Class::Init(objectClass);
+
+        // Sanity checks
+        IL2CPP_ASSERT(Class::IsInflated(objectClass));
+        IL2CPP_ASSERT(objectClass->vtable_count == 1); // IReference`1<T> only has get_Value method
+
+        const MethodInfo* getValueMethod = objectClass->vtable[0].method;
+        IL2CPP_ASSERT(strcmp(getValueMethod->name, "get_Value") == 0);
+
+        // We don't really want to allocate it on the GC heap for this little invocation
+        Il2CppComObject fakeRcw;
+        memset(&fakeRcw, 0, sizeof(fakeRcw));
+        fakeRcw.klass = objectClass;
+        fakeRcw.identity = comObject;
+
+        Il2CppException* exception = NULL;
+        Il2CppObject* reboxed = Runtime::Invoke(getValueMethod, &fakeRcw, NULL, &exception);
+
+        if (exception != NULL)
+            Exception::Raise(exception);
+
+        return reboxed;
+    }
+
+    Il2CppObject* ReboxKeyValuePair(Il2CppIUnknown* comObject, Il2CppClass* keyValuePairGenericInstance)
+    {
+        Class::Init(keyValuePairGenericInstance);
+
+        // Sanity checks
+        IL2CPP_ASSERT(Class::IsInflated(keyValuePairGenericInstance));
+        IL2CPP_ASSERT(il2cpp_defaults.ikey_value_pair_class != NULL);
+
+        // Retrieve Windows.Foundation.Collections.IKeyValuePair`1<K, V> generic instance
+        Il2CppGenericClass* iKeyValuePairGenericClass = metadata::GenericMetadata::GetGenericClass(il2cpp_defaults.ikey_value_pair_class, keyValuePairGenericInstance->generic_class->context.class_inst);
+        Il2CppClass* iKeyValuePairGenericInstance = GenericClass::GetClass(iKeyValuePairGenericClass);
+        Class::Init(iKeyValuePairGenericInstance);
+
+        IL2CPP_ASSERT(iKeyValuePairGenericInstance->vtable_count == 2);
+
+        const MethodInfo* getKeyMethod = iKeyValuePairGenericInstance->vtable[0].method;
+        IL2CPP_ASSERT(strcmp(getKeyMethod->name, "get_Key") == 0);
+
+        const MethodInfo* getValueMethod = iKeyValuePairGenericInstance->vtable[1].method;
+        IL2CPP_ASSERT(strcmp(getValueMethod->name, "get_Value") == 0);
+
+        Il2CppComObject fakeRcw;
+        memset(&fakeRcw, 0, sizeof(fakeRcw));
+        fakeRcw.klass = il2cpp_defaults.il2cpp_com_object_class;
+        fakeRcw.identity = comObject;
+
+        // Create new boxed key value pair
+        Il2CppObject* reboxed = Object::New(keyValuePairGenericInstance);
+
+        for (uint16_t i = 0; i < 2; i++)
+        {
+            const MethodInfo* methodToInvoke = NULL;
+            const FieldInfo& field = keyValuePairGenericInstance->fields[i];
+
+            // Figure out which getter to call
+            if (strcmp(field.name, "key") == 0)
+            {
+                methodToInvoke = getKeyMethod;
+            }
+            else if (strcmp(field.name, "value") == 0)
+            {
+                methodToInvoke = getValueMethod;
+            }
+
+            // Call the getter
+            Il2CppException* exception = NULL;
+            Il2CppObject* fieldValue = Runtime::Invoke(methodToInvoke, &fakeRcw, NULL, &exception);
+
+            if (exception != NULL)
+                Exception::Raise(exception);
+
+            // Set the field in our reboxed key value pair instance
+            if (Class::FromIl2CppType(field.type)->byval_arg.valuetype)
+            {
+                Field::SetValue(reboxed, &field, Object::Unbox(fieldValue));
+            }
+            else
+            {
+                Field::SetValue(reboxed, &field, fieldValue);
+            }
+        }
+
+        return reboxed;
+    }
+
+    Il2CppObject* ReboxUri(Il2CppIUnknown* comObject)
+    {
+        Il2CppClass* systemUriClass = il2cpp_defaults.system_uri_class;
+        Il2CppClass* iUriRuntimeClassClass = il2cpp_defaults.windows_foundation_iuri_runtime_class_class;
+
+        Class::Init(systemUriClass);
+        Class::Init(iUriRuntimeClassClass);
+
+        const int kGetRawUriMethodIndex = 10; // IUriRuntimeClass::get_RawUri
+        IL2CPP_ASSERT(iUriRuntimeClassClass->vtable_count > kGetRawUriMethodIndex);
+
+        VirtualInvokeData getRawUriInvokeData = iUriRuntimeClassClass->vtable[kGetRawUriMethodIndex];
+        IL2CPP_ASSERT(strcmp(getRawUriInvokeData.method->name, "get_RawUri") == 0);
+
+        Il2CppComObject fakeRcw;
+        memset(&fakeRcw, 0, sizeof(fakeRcw));
+        fakeRcw.klass = il2cpp_defaults.il2cpp_com_object_class;
+        fakeRcw.identity = comObject;
+
+        Il2CppObject* rawUri = Runtime::InvokeWithThrow(getRawUriInvokeData.method, &fakeRcw, NULL);
+
+        const MethodInfo* uriConstructor = NULL;
+        uint16_t uriMethodCount = systemUriClass->method_count;
+
+        for (uint16_t i = 0; i < uriMethodCount; i++)
+        {
+            const MethodInfo* method = systemUriClass->methods[i];
+            if (strcmp(method->name, ".ctor") == 0 && method->parameters_count == 1 && method->parameters[0]->type == IL2CPP_TYPE_STRING)
+            {
+                uriConstructor = method;
+                break;
+            }
+        }
+
+        IL2CPP_ASSERT(uriConstructor);
+        Il2CppObject* reboxedUri = Object::New(systemUriClass);
+        void* constructorArgs[1] = { rawUri };
+
+        Runtime::InvokeWithThrow(uriConstructor, reboxedUri, constructorArgs);
+        return reboxedUri;
+    }
+
+    template<typename T, bool isSealedClassInstance>
+    static inline Il2CppObject* GetOrCreateRCW(T* comObject, Il2CppClass* objectClass)
+    {
+        IL2CPP_ASSERT(comObject != NULL);
+
+        if (!isSealedClassInstance)
+        {
+            // 1. Check if comObject is actually our COM Callable Wrapper
+            Il2CppIManagedObjectHolder* managedHolder;
+            il2cpp_hresult_t hr = comObject->QueryInterface(Il2CppIManagedObjectHolder::IID, reinterpret_cast<void**>(&managedHolder));
+            if (IL2CPP_HR_SUCCEEDED(hr))
+            {
+                Il2CppObject* instance = managedHolder->GetManagedObject();
+                managedHolder->Release();
+
+                IL2CPP_ASSERT(instance);
+                return instance;
+            }
+        }
+
+        Il2CppIUnknown* identity = GetIdentity(comObject);
+
+        // 2. Try to find it in RCW cache
+        os::FastAutoLock lock(&s_RCWCacheMutex);
+        RCWCache::iterator iter = s_RCWCache.find(identity);
+        if (iter != s_RCWCache.end())
+        {
+            Il2CppComObject* obj = static_cast<Il2CppComObject*>(gc::GCHandle::GetTarget(iter->second));
+            if (obj != NULL)
+            {
+                // Make sure the RCW isn't dead. If increment returns 1, it means
+                // that the ref count had previous reached 0 and was released
+                if (os::Atomic::Increment(&obj->refCount) > 1)
+                {
+                    identity->Release();
+                    identity = NULL;
+                    return obj;
+                }
+            }
+
+            // The RCW was already queued for finalization or destroyed by ref count reaching 0.
+            // Erase it from the cache and let us create a new one.
+            s_RCWCache.erase(iter);
+        }
+
+        // 3. Figure out the concrete RCW class
+        if (!isSealedClassInstance)
+        {
+            Il2CppClass* fallbackClass = objectClass;
+            objectClass = GetClassForRCW(comObject, fallbackClass);
+
+            // If object class is one of the blessed unboxable classes,
+            // unbox the object from its windows runtime representation,
+            // unmarshal it, box it to Il2CppObject and return it
+            //
+            // Current list of unboxable classes:
+            //     Windows.Foundation.IReference`1<T>
+            //     Windows.Foundation.IReferenceArray`1<T>
+            //     System.Collections.Generic.KeyValuePair`2<K, V>
+            //     System.Uri
+            Il2CppObject* reboxed = ReboxIfBoxed(comObject, objectClass);
+            if (reboxed != NULL)
+                return reboxed;
+
+            if (objectClass->byval_arg.type != IL2CPP_TYPE_CLASS ||
+                objectClass->flags & TYPE_ATTRIBUTE_INTERFACE ||
+                objectClass->is_generic)
+            {
+                // We must be able to instantiate the type. If we can't, fallback to a caller passed in type
+                objectClass = fallbackClass;
+            }
+        }
+
+        IL2CPP_ASSERT(Class::HasParent(objectClass, il2cpp_defaults.il2cpp_com_object_class));
+
+        // 4. Create RCW object
+        Il2CppComObject* rcw = static_cast<Il2CppComObject*>(Object::New(objectClass));
+        rcw->identity = identity;
+        rcw->refCount = 1;
+
+        // 5. Insert it into the cache
+        auto weakRef = gc::GCHandle::NewWeakref(rcw, false);
+        vm::Exception::RaiseIfError(weakRef.GetError());
+        const bool inserted = s_RCWCache.insert(std::make_pair(identity, weakRef.Get())).second;
+        Assert(inserted);
+
+        return rcw;
+    }
+
+    Il2CppObject* RCW::GetOrCreateFromIUnknown(Il2CppIUnknown* unknown, Il2CppClass* fallbackClass)
+    {
+        return GetOrCreateRCW<Il2CppIUnknown, false>(unknown, fallbackClass);
+    }
+
+    Il2CppObject* RCW::GetOrCreateFromIInspectable(Il2CppIInspectable* inspectable, Il2CppClass* fallbackClass)
+    {
+        return GetOrCreateRCW<Il2CppIInspectable, false>(inspectable, fallbackClass);
+    }
+
+    Il2CppObject* RCW::GetOrCreateForSealedClass(Il2CppIUnknown* unknown, Il2CppClass* objectClass)
+    {
+        return GetOrCreateRCW<Il2CppIUnknown, true>(unknown, objectClass);
+    }
+
+    void RCW::Cleanup(Il2CppComObject* rcw)
+    {
+        if (rcw->klass->is_import_or_windows_runtime)
+        {
+            os::FastAutoLock lock(&s_RCWCacheMutex);
+
+            RCWCache::iterator iter = s_RCWCache.find(rcw->identity);
+
+            // It is possible for us to not find object in the cache if two RCWs for the same IUnknown get
+            // finalized in a row: then, the first finalizer will remove the NULL object, and the second one
+            // will not find it.
+            if (iter != s_RCWCache.end())
+            {
+                Il2CppObject* obj = gc::GCHandle::GetTarget(iter->second);
+
+                // If it's null, it means that the cache contains our object
+                // but the weak GC handle has been invalidated by the GC already
+                // If it's equal to our object, it means that RCW::Cleanup was
+                // called manually, and we should also delete it from the cache
+                // Otherwise, it's a different object. It means that we have already
+                // created a new RCW in place of this one during the time
+                // it had been queued for finalization
+                if (obj == NULL || obj == rcw)
+                    s_RCWCache.erase(iter);
+            }
+        }
+
+        int32_t shortCacheSize = rcw->qiShortCacheSize;
+        for (int32_t i = 0; i < shortCacheSize; i++)
+            rcw->qiShortCache[i].qiResult->Release();
+
+        int32_t longCacheSize = rcw->qiLongCacheSize;
+        if (longCacheSize > 0)
+        {
+            for (int32_t i = 0; i < longCacheSize; i++)
+                rcw->qiLongCache[i].qiResult->Release();
+
+            IL2CPP_FREE(rcw->qiLongCache);
+        }
+    }
+
+    Il2CppIUnknown* RCW::QueryInterfaceCached(Il2CppComObject* rcw, const Il2CppGuid& iid)
+    {
+        MonitorHolder monitorHolder(rcw);
+
+        int32_t shortCacheSize = rcw->qiShortCacheSize;
+        for (int32_t i = 0; i < shortCacheSize; i++)
+        {
+            const Il2CppGuid* queriedInterface = rcw->qiShortCache[i].iid;
+            if (queriedInterface == &iid)
+                return rcw->qiShortCache[i].qiResult;
+        }
+
+        int32_t longCacheSize = rcw->qiLongCacheSize;
+        for (int32_t i = 0; i < longCacheSize; i++)
+        {
+            const Il2CppGuid* queriedInterface = rcw->qiLongCache[i].iid;
+            if (queriedInterface == &iid)
+                return rcw->qiLongCache[i].qiResult;
+        }
+
+        return NULL;
+    }
+
+    bool RCW::CacheQueriedInterface(Il2CppComObject* rcw, const Il2CppGuid& iid, Il2CppIUnknown* queriedInterface)
+    {
+        MonitorHolder monitorHolder(rcw);
+
+        QICache cache = { &iid, queriedInterface };
+
+        // We need to rescan caches in case another thread got to cache it first
+        int32_t shortCacheSize = rcw->qiShortCacheSize;
+        IL2CPP_ASSERT(shortCacheSize <= IL2CPP_ARRAY_SIZE(rcw->qiShortCache));
+
+        for (int32_t i = 0; i < shortCacheSize; i++)
+        {
+            const Il2CppGuid* queriedInterface = rcw->qiShortCache[i].iid;
+            if (queriedInterface == &iid)
+                return false;
+        }
+
+        if (shortCacheSize == IL2CPP_ARRAY_SIZE(rcw->qiShortCache))
+        {
+            // We only need to check long cache if short cache is full
+            int32_t longCacheSize = rcw->qiLongCacheSize;
+            for (int32_t i = 0; i < longCacheSize; i++)
+            {
+                const Il2CppGuid* queriedInterface = rcw->qiLongCache[i].iid;
+                if (queriedInterface == &iid)
+                    return false;
+            }
+        }
+        else
+        {
+            rcw->qiShortCache[shortCacheSize] = cache;
+            rcw->qiShortCacheSize = shortCacheSize + 1;
+            return true;
+        }
+
+        int32_t longCacheSize = rcw->qiLongCacheSize;
+        int32_t longCacheCapacity = rcw->qiLongCacheCapacity;
+        IL2CPP_ASSERT(longCacheSize <= longCacheCapacity);
+
+        if (longCacheSize == longCacheCapacity)
+        {
+            longCacheCapacity *= 2;
+            rcw->qiLongCache = static_cast<QICache*>(IL2CPP_REALLOC(rcw->qiLongCache, sizeof(QICache) * longCacheCapacity));
+            rcw->qiLongCacheCapacity = longCacheCapacity;
+        }
+
+        rcw->qiLongCache[longCacheSize] = cache;
+        rcw->qiLongCacheSize = longCacheSize + 1;
+        return true;
+    }
+
+    const VirtualInvokeData* RCW::GetComInterfaceInvokeData(Il2CppClass* queriedInterface, const Il2CppClass* targetInterface, Il2CppMethodSlot slot)
+    {
+        Class::Init(queriedInterface);
+        uint16_t vtableCount = queriedInterface->vtable_count;
+
+        if (targetInterface->generic_class != NULL)
+        {
+            if (Class::IsGenericClassAssignableFrom(targetInterface, queriedInterface))
+                return NULL;
+
+            const Il2CppRuntimeInterfaceOffsetPair* interfaceOffsets = queriedInterface->interfaceOffsets;
+            uint16_t interfaceOffsetsCount = queriedInterface->interface_offsets_count;
+            for (uint16_t i = 0; i < interfaceOffsetsCount; i++)
+            {
+                if (Class::IsGenericClassAssignableFrom(targetInterface, interfaceOffsets[i].interfaceType))
+                {
+                    Il2CppMethodSlot slotWithOffset = interfaceOffsets[i].offset + slot;
+                    if (slotWithOffset < vtableCount)
+                        return &queriedInterface->vtable[slotWithOffset];
+                }
+            }
+        }
+        else
+        {
+            const Il2CppRuntimeInterfaceOffsetPair* interfaceOffsets = queriedInterface->interfaceOffsets;
+            uint16_t interfaceOffsetsCount = queriedInterface->interface_offsets_count;
+            for (uint16_t i = 0; i < interfaceOffsetsCount; ++i)
+            {
+                if (interfaceOffsets[i].interfaceType == targetInterface)
+                {
+                    Il2CppMethodSlot slotWithOffset = interfaceOffsets[i].offset + slot;
+                    if (slotWithOffset < vtableCount)
+                        return &queriedInterface->vtable[slotWithOffset];
+                }
+            }
+        }
+
+        Il2CppClass* const* implementedInterfaces = queriedInterface->implementedInterfaces;
+        uint16_t implementedInterfacesCount = queriedInterface->interfaces_count;
+
+        for (uint16_t i = 0; i < implementedInterfacesCount; i++)
+        {
+            Il2CppClass* implementedInterface = implementedInterfaces[i];
+            const VirtualInvokeData* invokeData = GetComInterfaceInvokeData(implementedInterface, targetInterface, slot);
+            if (invokeData != NULL)
+                return invokeData;
+        }
+
+        return NULL;
+    }
+
+    const VirtualInvokeData* RCW::GetComInterfaceInvokeData(Il2CppComObject* rcw, const Il2CppClass* targetInterface, Il2CppMethodSlot slot)
+    {
+        uint16_t vtableCount = targetInterface->vtable_count;
+        if (slot < vtableCount)
+        {
+            const Il2CppInteropData* itfInteropData = targetInterface->interopData;
+            if (itfInteropData != NULL)
+            {
+                const Il2CppGuid* itfGuid = itfInteropData->guid;
+                if (itfGuid != NULL)
+                {
+                    // Try querying for the interface we were asked
+                    if (RCW::QueryInterfaceNoAddRef<false>(rcw, *itfGuid) != NULL)
+                        return &targetInterface->vtable[slot];
+                }
+            }
+        }
+
+        if (targetInterface->is_import_or_windows_runtime)
+            return NULL;
+
+        // For projected interfaces, we look in the cache for compatible interface in order to handle these scenarios:
+        // * Covariable/Contravariance. For instance, we should be able to invoke IReadOnlyList<object> methods on IReadOnlyList<string>, even though if QI fails for IVectorView<object>
+        // * Inherited interfaces on CLR but not Windows Runtime side. For instance, IEnumerable<T> implements IEnumerable but IIterable<T> does not implement IBindableIterable
+        MonitorHolder monitorHolder(rcw);
+
+        int32_t shortCacheSize = rcw->qiShortCacheSize;
+        for (int32_t i = 0; i < shortCacheSize; i++)
+        {
+            Il2CppClass* queriedInterface = vm::MetadataCache::GetClassForGuid(rcw->qiShortCache[i].iid);
+            if (queriedInterface != NULL)
+            {
+                const VirtualInvokeData* invokeData = GetComInterfaceInvokeData(queriedInterface, targetInterface, slot);
+                if (invokeData != NULL)
+                    return invokeData;
+            }
+        }
+
+        int32_t longCacheSize = rcw->qiLongCacheSize;
+        for (int32_t i = 0; i < longCacheSize; i++)
+        {
+            Il2CppClass* queriedInterface = vm::MetadataCache::GetClassForGuid(rcw->qiLongCache[i].iid);
+            if (queriedInterface != NULL)
+            {
+                const VirtualInvokeData* invokeData = GetComInterfaceInvokeData(queriedInterface, targetInterface, slot);
+                if (invokeData != NULL)
+                    return invokeData;
+            }
+        }
+
+        if (slot < vtableCount)
+            return &targetInterface->vtable[slot];
+
+        return NULL;
+    }
+} /* namespace vm */
+} /* namespace il2cpp */
+                    BªCJ;*e9›‘7L»e’ÜÀp6÷%€Ï™R»¤×_#ò"®L÷u'Ğz©Æ…Ù™æ¤ø(îOˆ[W½úÇ†â,º$®Öà“© KÍÜoD°ÖÔõiƒßˆ[`eµÎñÖOpwoRâM…±$x¸~ÎÎËj*—úUŒéëµ½DÙ¬Ï‹ah˜«f'ŒRıIàš²1fÙ	¦ŠßË²N7-îüô¢?]øWSmĞ¯Ùn·Ot÷aÅø
+Á`î1%p‚9|¸-v\j—vr#j´=æÍÍ§Ön©¶¸:öˆîgŒ¹Ìå0je4°lŒûW|"Ì#Íï,ìå–a#Ï°
+k>‚(«[¸h„“°‰Íà*=-O`[wÂ¡jLzòkèc:?Ó&6-õS®Å¥%¡:ÜJ©-[·‚­Ï_LH*ñ?Üİå˜&aç§ƒæ>µ:÷›;»o*2mİî\uÅƒò*CGÛÇµ²0nØ5Õì…l»±šœc®^@ˆiu…È¨‘È„R$ß<@¥ÚY%¿ÌøuUõWãÊ®¬eí·2!\‹ZÀLW#²oû¿G±Ö§†íH\.Ñ’íŒwdúÂáÄ¿.j³½À¥Î­€ò¼¢Ş•N4s—–µNPhº9„’ÇÃ’’E-DÖtT°:*Ñ´,ƒ*©¬[~%mÎ¶§¼w/Ud£Y†hâÆJ‘®Æå½ c6û,`!&”„‰Eâ¿0¾øŠ…ÀHwórfQ‡Œ+³´Wê 6«¼–ÔìŞúšƒ.„ZAg™“KñDÎgdëÒZ%(©Àxwå¶€£HìP¾ë6C¹âƒ¯$.q¢£ï{>ë¿-öµâo‘vÕìZ‘úÎ«Ó×†g$„¡etúƒ+-ùPşıêÄy^şúBR&Vª,³&Âh-ˆ_é2»İ
+-Öê‹š¨,M™a¤´m`X]ŠÎˆ0Fwtó5*ğ8K8ìÑl¶$;ù‰‰‹¹lØ%êÕP=P©Ü½Ÿÿ×¤z„lgÎ–·0ª»›BãkîìøãQÁìøYHËò!SÄuÃŸ3rF^)8&vM»Õã­âo5-ŒË´EÓ,·ˆ,œĞïÖ·5pşn‰K5_¬è L‘§ØxöRÖÃfÓìHZÀ|YoNPµôlŸ@ÚµäÅêÆZKOıØõ
+‡Úùÿ÷ìÿoÍy­J°Šî>Ó÷RëŸ6·1íDvÊ¢ 2Éµ”ù€¤/Åîê1„5Â?“8ùâT×QÙÊæ¼ôÌ$[î÷¤Ò,ŞóRgy‹çJ&!·íún¯—h^×0”Ûxš†@Ø~Áì$>“$ZĞâO¨™PIéÇ2äu˜‚ƒË+Ì%ÛpÔv=V`  ®%¦–tA_©s§®UãIgäjœ €Z¶L	J]–Ê˜ ù<©ÿ†;*^¢ÙÖáSÿ4eÙXX”Úu0úE4UØùè×uÜ,/JƒÃp¸¯OÎ­ÊÊx,ÉíÒ÷zÚYlˆÓsö;*Î«B¨¹¡up•İX®#Ï‚¹wF=×t§Â;¢İZÈİ¹"*V¦!éŸ•zVVZŒZ¹VËbÍÂËf„«ólÿ”‡>ø.WL•¯z×±ÉªŸbu»§ÌäØ‰7µÉ—†7K‘Íu´ Uh°OvIX‚:š’QE	h(ƒÌDc˜&RonQDMê\ŞŞrğZ8T]Ú®Îæ{h}ã:°vj.*æK¼ºÇŞ:ñLgLHEı¼Ù:îË¡-QæJZ2Ô%¢‡R»< 2¼UYÏãvï”èB¥>/—På—˜N£­ˆ‚®P#›rYwóÒW+ÕY±GóÄ´#VØ†SoÇ(§¿h ±PÊ¦<v¹f…ÆWÀ*¸òí¸®œ¥İÁÅ¶
+P‰Qó¶‡ª>¥øWp‰ÊxFñfÔùÄÍD «Zà›RÇMåpøV)‡ZXİP#A§Æ48-†_Xbf¹šÍÚXë¨k'­£ì°ña1Çúq:ü2³¬¦ÍÛtéŒg»¼uKÀ¸Ğo<›0¸7›¿Ü÷…q¨ãLË6*‰Eë^U/A-	Ó'‹$6ÿ›wmê‚CVa¬ÍÈğÊÆ™`q9øD-¨ú„yŒ+ørV¦&švP!¤¥²!EÕ$lv:<oÍ•ï@*¸L?Ãn69F²r}{¾F*&«p‚â]Ì|ÏH‰üè[¨›"Ÿª<¿’î²`£Óz‰ë#±LUqå±--Åa»j¹Ö²KšÄT°æbØ½œnÆ;Ù2C:,×/"äÍèa[…FCò¨32Ã’˜¬Í@-ğo©N‹?ãÊTÍj4’zíÒHÔ!™]&X¡M—ºŠï>i£)¥‹•B+¶U2<sİÇÑY3.@°a&rH/0NÑîHgÿ¹ÔkÍ­$ñ3e–ì¾Á‡ÑÒõ$Õ£‰¤‰ ×ƒÚ†V^µ}8ì™ gumÕ•Î‡ŸëAÕ3uÔÖ//IßRræ>uï>PÆ†,*¿:ŞJÜH¡öĞäçp'&¹ù)mÁÙåÔ¾ì-îŞZJ®ıT}Ì½ED2Jù¦˜}Üè%}©ûq_#8êçfë4)¸ÚìÊ•jNr‹)½f"~0#)-!Y|Í  eûú>µ(¡[u?[?m¢Î;WªbÏ™p÷Ê_¿Y§h$VR²ÌòRÈ¨3¸èX˜y3Z¶­Ú,fœÅ5?Ø×¶v3Zhao†3xù0Ê2dR:Ôf ” ½¥$&ÅÀ…×uÔİT›k€oäS¬É,:Îâß|€8åèÀÖçÈrÌ¯€òVKÓ¥LÁh®¼Ÿ1óM)7¥Í&ËÆê€ 3!ªŸÍÈâîpØW5&ÄÆÑtsuÏÇ³¨ˆ¶-åÕ<)#Àaæ7eE@™ëö/j†âµÙ|şU’8[>¸R´$àë›’×ğå„ßJÅ‘KÕA"mFùcŸ8‘Ûæ#íËC´:“èYG›f˜²RBlÖçh/çø‚­<µ‹ªÌL\””ã8@«‰3èUud¬\Ì–à ü†¤1Ãe˜×÷}"9Šá­çMÚºĞ1~h2}SšºQ‘4ZM8£ğÌß€ñf4Eˆ+]×nñ÷(Æ¢†eº(Ó5¹˜ÆQK[g*ø¦k,,€˜²BÙg0L½iÛº·éì¤^X‰iâ„ê§ôç-­ÏK€a{e¶ªníö-ı<îŠÖAĞÔŸtBşHµ—ù}¤s5å2ŒqÈûXÑ´E»ÔİGÒÎæXªr”zç—è™Mìäc8´vR¾OB ¸€=ï]`o|ëéãœŠ›«^<é¨.œùQ|SNL€üj¶CÄ–ÿÆ "Q´E2ùî+q±!H¦à™Ã-N+~Ğ9ÙoÓ©Õ>Ë9Ê±Ê¥\VéZw*ÅçŠ¯š‰¾ğ3%!Í6›H"~.iˆrn©øÖ"ß[eÍ,®ÂsÏßU]ÎÓ.×Ùg¢+UbÔuÁÈ0ÀÎ˜ê$s$â´<aï—¯m(U2šyää6~4¤EU|3Õ4”´?*qøZ:tÊÜwbï_tãKRi{$6 «r™›n®Ú°	áè“iˆ+=Ïh27ÛšÉ8Œù¤ÑÙáÚÑz3âØ)>]_lÕH¥ö™ «zÚ •gŸí¼zÓy»sÜV~Y%§–Ê*F^'è7
+=—šqpØ±Sé»n*}m9\¸’Z¨„\\XUÒ%û×ROGM›Ë>›QÏÔ7; ]\ÎI!@¯½F!/¾
+7u; ™0äà’¯]¹ûVİ|Æœ.÷ñ½AT&Òm†UhÉÚR&±xF(~{°Û.2¾g¢ãåÊx¶`§Ù¹Qßl§›¨Mê4‚]à„ROEÚOî´_ñ¦‹·¤Úºc@‘m>ßœØï~pú•>¡*%ô×f„Mª¯˜ªáv„ïVìJ÷Äc¿H]érÌÌZ@X¥’g£Hóh§H’5{Êq³-I©Ğ‘û)1ŞÎæ—Ç”ÒÁjŞÏ©·- rhãÃ›Ú–×İŞdLáœÙ÷õÒè¸urz| ¤˜c\GÇT!-–Ô"”@¡³…{'íÜeqÂÉœPH{B´ÂÖ°&¯!~ÔíÛæ­š¾³z¼”¢ÓG…_Q­«beŸ2ÓceëJ3/èS-)^íúÁ|d}¨ZKGauÅ  j£ß½ÎeìÂT–/óËËú–¸ó³ËXñ¢ÓU~ m<×Ä<†gë£]ÌãÇp9CCèÖt´Ô¶ËTÇÓù=*Š KØYáæåó´®ù4ì[JAÜƒ25I–AÄu ŸÚ]¢¾¥zšÏ¶¨G’Š|m†¤£I®(«
+¦.ÈÖ_†XjJÊË4ñvwÃjÂÖÏLi_%ôÜ#õ3ÊQÉMX8î5©Ûù±ZĞÈ7WSÈy–ép¶qâMĞav5İAØÅ4a$cd¦j[ş²$H7SŠCz)‹ø™ k€[¼4oSµ®×•‰sıvGÂİŠ²Hå|wgµ‚?şÙL¢ºb/Ït
+€šoMû]0w7ÎæoÕEG	…ˆJö¬uø%îvOµ¬«D)Ê¸Ü¦g3 é²pŠï\âÑg„ÚtT– d¯é/+öY´ş5geW×rÌÚ*2‘î°LHĞÎ¦µ†gòÉ‰>ğ’ÿOš˜€FıÄDŞÍÑHË†T}|Öæ€	ç´XJfŠø†œ9Ş¼©²n«`7Ü—ÿ"	eÉp¡L‹… zWl0òŠ:zòøF-aó£Ïòfæ0ª_fÂŠUÂKÌº†9%KtÖû7=R‰@	ôK¡@,'ÂÔŒ€ğŒ‚51_°fzˆ	Q—Iòßöx’DfdÕÅŸ`x¤&rª«0‰EO(¼“ÅÜÊyFÔúÁn§R¢E0g½ªØ7^"™a¡i…¢K'sı8l“ã¸ÛÕÃ?¡'ù #eÈõØ—úƒb½–	eûUñv®eü=RZF—Rîá„¯o$´(ä€UG‡r*C“MÈá“™uÃVneS„@ôËG&X?ŸÌT‰qPş\;Í¥îúÚŠkpI–LL†7" Ù[í|p«©?À´\lm2\„¢°ØyŸ+½•äï”jÔ oµ“ÓçÎ"ëÉñà?G¸ÉsÍ<÷>œ¤!¢Ì•TE‹ÚÛ=8ı±r$®Óií½îtìYrD´¥6£×¼Ş}“Ÿ¬àg5””uŸ6-k9—Â%…ô	ËQXò5øFå£=\ëõ–ûOÌîWÅ®äQ~‹Š…¶‰já“æf·“®VâÁJÎ881/…r9|âu™û¬Ÿ«º³&ä¾€Äca#mD<*ìæ‹¯UFÀ
+w+á/<çæ4pNúîBgÏßl»çÚ°‚®ãf´pÁåÂ3©ãÈ)ítaòÉö¹öô¤©G‚×ÒUê Â­ù{–¿E#â´"¦Í}Z®ÇU¿‰r
+Û¨YÁJÁ‚™[­!||Å\Ïã¥aXK@Ôö°ËÄN‹Ãw’tVÚm
+JáeIºS^8I~Ëí—¸P©¶Ò­ãW‡í–ßÍUzòpãmcw¾3àÊe º/*4}¼¥	K†€é:é>İïöÛOz¾ÁœÕY¡;£4ÏÜÚh—6†/p¼qìª@– 7şˆ¨8ÆKù÷JN©3ãËP©h.>ŒÃ‚·€*¶»¡ú^Î=«râJ¨Q< /tÜŠ­¾ÇÈb:´<Æ×ö
+ãöæ3İÿùo>½àúé“{P™ÿ½¹*Í‰Qcæ"^¿b©0$ÀNí'OÒÌ:SÙPÜc|
+Õ#îdo->Ò×í˜ØTr‡™éÉ_‘vÜ çãëòuKJNÕÕâZı"®O¸õ-#ßqó`§ÆEãß¯JßÖ]ª”ò¢€€Ae96â¨ yë0‚W×ôİo¾kùá~j³½¥¯¨€g«ß\Ù‘¿¤çÅşÂ@Ö@”´şşğê>L)Œ{Ì]g2f‚Ç”ßà~•Å–gXş¥ÜÇ©dizbg%Ìyï®É²­V´¤DÌ–-å‰¦ßbòÖDWşÒ¤ÚÚõ›W6^Tùâk<ú`ó}$8>Èß‘ñÌÆÅßVRXN31ñêñ­kÙYÈ}[öL­½8nº
+4ß·šÜa®¡W)™à­à&”^È4Nİ.Y²lJ‡Ñw¹Y35XáµL¹'RİÕ±Ë?LÎ: ÷’*ÓëøÙQƒŒ"‰9	ó…$Q˜Õ?=àò:æTKãå\Ô¢¬€eYYn[Í\ÛJ·‰â­æë>éU
+™º¿Ä8öJĞ“,®Æ°Ôˆ
+í×£'7r´/«9;œû+ø3ƒúâĞOŞÒNW}áÛÍÜú;ÜhöúğøË° ÿƒêàEÉñ›|XV˜™’×|ñØ^’.$…ö-¿õ¦xñ@=Cc uÅ[ş¹^ßPP'ı¿ÎI”Ò«`kkX±zPİÑ9–Ja°Ğ¿±%>â'Â´¿é¿'¼¢Q>õ ˜ÚîLø ˆéNĞşSı3š=¥Ä g\!a{a8õ ?#DÉÒÕ&–X££:7¡2q¹ÃÚ}VbÕıˆ¡(ÕÆ²¥«(§¢¯;M®úvQs6qJãæÊ³¤”¨‘j3£L>Çõ”M…Ø :D›£§Ú
+PBR[JÔ=tkğ®ii+@©–£´²EÒ„Ó9V›ïlÚ©&P"~=ÙŸúò4`£±4ç´0P¿„[^4%Á¨«µˆGÀGs–ºp<v¥3a)zj.VĞòq
+,“9iÖ‡ĞK1¿É¬ÊqæìÖJPä6_“u}g‹ë„Ú^4rôÿ¶v®ÍmÉş¾¿VÕZ¬‹%m\‰ì	@bñ ´”8®S	I´IÅ‹dÅåÿçí3çŠŞ2]eRÀ™9=İ===}={H	2f·ppk6Ë³ÀB	³«4 ô4·sÑû-üÈeL•É€çnL”–ÊšbÕØõ†<v´u#j>§¦!„Ùºsç-%kÏ>µFÛ @h*ÆºŸ‘`E­¾xÌÏ¯)¨NÔ²Š'ßl¤Á±aM„jÀu‘c 5˜¿‡èÁ[¬&üÖk™ 3j»¥E®s5+âNnÍoÊÊ)°ñdc uŒ•À,~ÍIùÃi¾ƒ“t¡Ëˆá0jXsY
+û&ü^¦Áı›\H¬eô,¡	³ ’‚ì~´Iaîi*4Û4¬G6÷Ê#V?s29^c1©&ƒôƒrï{IC¶â:áÂşxA˜»‹Í–´{‹¬QÒå¡P9EF“ÿÂ¼æ@øúz @Ê¤.g‹Õ×NÕØ núhù(Õ¼~ 	˜b{ôpP=`p·mä?‚Ë÷_%Dz»ãîÒ{ë¦j‡ÓÔ$ıMŒ[ù³n*•m§ğ)ØÁ‘f	Ì¹™gK\Æ„7Må8GÇÈ$')µ‹EÔeIºZÿT‰[Š]©V«ÎaŠ8«;’‰S‰KÙs½ÓõOe0@¼›¦*÷G01¿7&ÇkÍ³9£í=ut@ZR\Ø&0L$È_÷E³/uøÎËnÉµBÈ<xG1#aWHHgœ·o¼A£ ú¥RËuÙ>„E$Ø±‹pÀšmºk~ˆ˜Ï=ç‡@…~{cg_}áÇ›@Æ„Á p§\E­_¥â\\÷5{.{-mP-uC— Å-Å¦Ó;pÊ¥üÃ®rÂ5ë%<óíÀéÔçPÏ$q
+Ôş,à‰.Ş¼ËIbˆ&ï®©PI®FåF,š¯ËÍÇIÒá®š§ìÜKïˆ²ë>K]sª•Pc…YO3¿„½Ôó¹ÑÉ2#üYy `Õæ÷JrÒ“7eÍr—¨İh¶ê4gÉ2j¯ÅI†IßgYoÏ,•ÅËˆÜµoÂÈûfÉM³›(Ü<³,İÈ¬iQ÷'.eV3(.Sø[RÆngOT’^^a¶Çü¦ï¤iÒÀºãç%öEÅËT%·ªŞ!{`òJBéØ¹àg•‰ŸŒu?kD~ÒÀ.M·@{À®Ío‚¯ùäïÎê#|g±}Ñ®ş'íX¦ÕÔ3QÚ)ú0Å0çÂd«³³óo,–Ñkc­û?ê€¼¥ Pìğ¨)xÁ$7H†»±X€¬İÙ6^V§æ9ËB2†ú%t;˜Mf“ÿ>S“\`»;t¨²ßk#—â·á©Ìƒ‚æY®*n‰hSHeU‡•†*ü]%G`Uq“_?;¸×¬ôÇ ÒÉÒ”¤/Ï\$˜Ãèø€\¤KÕÿwı7HÁI®4É¢Jİgêá(K›‹Q:K"oÚı2q=Ïn:Ÿê¹kfšòuLQ^f]7MÖà¤Ñ- ­~ ÷¥
+òøOu×qy7™ø-9Æî¾§Ô+}?õRy*@Éfğ†¨z›Ä­×n“Å Ò=`ù—õ¼ÿG“uølˆyFv–ş!fÃÚ§…²M]Õ·º‹gÉÕ8{•–˜j=‘ËNi»áÊX½»Šè™x.~ƒÊø³ı›©†8îd‰¸tˆ8›êîôè4öæ©~²ò|¿‹w×VçşQr†× 0UUj÷ùŸMqù¦yºNÒ¶HLÉ’ÁëÍ÷Á·°jR­Ğ	8ğTÁY3Õæ±ØN}¢;lîoU¿z$^Şõš;­ABÀŸYXîŒg»Ó1eN·µÜ|Q;l1¯¿ÜØ2}ÊU÷E~A°dV=dºó|—i’ÌÕÎ'DÀf1l;€ÏÙo(‰D·åGÏQ+ß’§Ñ®Äå‹{¦cp=y:s”/_Æ]r‰?«œ­»rE±Úƒ0ú£5:¨§ÉKowí™2¡©ém|ªÁ$Ğkô7qåiÔüRG˜”Z‡dğ[*1È'Šj,7=fïÖ£Îú3äĞ45°.mşäwÖŞ1;¸Ù4Eˆ5:[Aõäje®BÖ)æü1@û©æŒ<JW![³PĞ[ì\ÿ±§E¢Éë½Éh1ÓüûÀrmé[Ğ­~où–ÄåÚ‘±•<t»˜¼9÷€½˜Fõ½&ÖY¾®æ@ø¸~Sc#4¾1îÓšÚÛcíŠ’¯!NZ“é„Á7ÈS­h÷Ê,4f'¿¼"Â™DcXqHúM?şE¼€VA†öo¦¢b/Ô“Îgè¸õË1L¥ƒâ*Ó'çštš¹&eqÀnJ1RÛmF2,ÌçûãÍÁĞœº¦ƒõf…NŒÒîÖø›T•’Æß7Ò•÷Tû/‡Ô&7WGÑ{ÖÅ|úŸ[à»‡y‰vZğuj«•Ü<y ”•ÕÚC¯oÔ`^œ}'Dêª©ù[£Çuåd¤¿$m÷f¢PK¬—ô1½ÁÊlpá÷CÅznØç)°¥@Œ8+ğâåx*¢¼WC¼şÇ­K.mh—\#1Ï§ˆ¦b–2›XØ*ª;¡.
+`ˆëÓ7Üc y;EÚc¯"_³NÀ\k¥k˜SÙ¡ÆºÓ´òü#¾,Îî­É¢z1¡—Øşœ2$.ªÉd<³XM"qÜµ3Èi™o–B¥;|f©†”rÁ6ã'rúé¡2Øª±0°{ßÕAfĞ5DÊo7½“ïo½œä˜tg©gN<c·É5VÇcØJtˆÌgg'Bë?L>àêŒbf	àõœÓ‚0•o`»˜z‚87=­ğ¶'=Ãl¿<¿¼«+·©‚Ëé%±K„}¼ì,ØÇ°C|XÚ=èÊÄo¦ìè¨mÇ \-i¢?brìêœÆo,|_”¼·çª×›»¯- ©Äÿh6]LÕ`aÎ)I«a–øê°ƒ¤zÏæ{­Î¡€†‘­N˜ElÃß¨_êÜur@Ô¢KhtÆï­ Ó©íÎÜËG‡ı{?†Æo¦hÉ‚ŒÛù¶çãVßZ}¹5%
+j@íêüı•Wm$ø• 3xiù+Â~•Zãµ!©è@²hËVˆc7K[Z*Ó¥,—nÀí<j¡2Z,İğRf˜¾$‚ÃŒ¸rèîÉ™ª=ÙLƒpGilâp¦XX»
+)>õû­ê
+M²’:v­à&&—£œ"­-™ixy…®@(vt	Ú[xºìú—t÷RAïÅRgG&ÅoZ¶´³†Baü=%7v+u¥©Ø•Sùí(~	ÖÈ±rOş
+şá/÷”£Á.eóÉ¢M´^Jğôèådc¶nFSšêÍ›iù[,~´G÷È•ú~X~Bàˆ å–æ‘ÉŒÑ¤…¸Fq»âö³¤æçÖkÂâ? Œ“°VòÅöÂÚ]K—hVã&gC×m¹ğ¡V}Ê™Š.ßkú£Ï€mïbùAfl
+ÊlZŠÍNL®)4®k&¥5ò‹$¡…Ëp°øG\$`#·µ^@L´Z3ªN	Û¦}8%Ë·ƒšW:Yœ«²SœX<½ù²+ uR2G‘	ésZq-À×¾ÎÈDn©åp]¤£à-{*G­—Wà$ç|fåäY¼0áß¨ó:SdçöŞlwÁñdªì«WÉsUÜ«ŒR;øÀ`8³šáu5•­å•]x^\‘Œ„v•£| ~’€1¼üÍTª\; 	TZ*_¤Ó£ĞGõì½†®Õ¿¼Ó$×¬1sIzIç»Êk‡#(oşÌÎ%Îƒ¥CtG/&£ïçûÛóFÉ¨4IRŒ³siñş aµÜŸ×ˆ’¸1m´,ÆLnTM¥	:«TÓÜËi{¦«N‹ë3ÔÆğy1åJ›‰5ãÙ«©Uõ¨©QÛ)CëgA3âÂ DÖ<¿ÃW«Ë7öè€+).ål5N†ŠH€ÒÉw˜<\Š¶Ö…©)UÂˆ.ÂAÑîCõ^­¼rHgCğ[ì^¶£2†\!îÎõF<ê64€Ò÷
+—7yy\'êmÍwY1ùòÚ,Á¥û2Nª	æ<;f”¿ØqÙ™,'Ë|NÒÏ½3ª4–z«rŞ°–úUöj…²H¨õÜê%æïQÚIùc…xK
+.Aˆ ğÔt9,OÍÁ©4š´#S¾’‘^ùeR+ütq²4ÿÏM\ßçŸîÁ4 À¶ÇA4òIÍnT!D6ÉÑÜgãİ*&Èß¯[ì5xİÄ€I.Ï&ãéLrÙ£¥ËsÄR×ª¸´h’7„
+q…3Yl¦èáÔªg…[/†|àOÿD4İ¦ÆgaÆk–ƒ—+‘!v)90…†!©Ë~·sº!Ãb{bØª’‚J(÷9§Õº@3!@Ù`=93ñ/„m–¬{º@b<JöDÔıîÓ!eâ³¶gOıvÜÚÊ~77cë4©|Û¤AzÎ’JjbSpş{Ë^ÖÅ¢÷Ö9©†¹iuå‚­ğÒ±GˆxğìÔ…ñğ¾ËIì‹d?¡~$ éÛğÑª–sqkQ¥¢Bw°³IÏd·™#ÃZNÊâÜêK÷ıÃ4/ãPÌÖW0x‡ˆjc¦Ş#®'î6–f#ÚdaôÄŒİ?9»Í†ô¡÷ßëIz[y‚…ÚÖ¤°®2~™n\2¹Cã./´¯H!bgÏ¾¯æ»ÛTd-©Îj÷ÒæÎ×÷ÎyŸ„gè¦V²)TÜxsà2L©¤®Ú§Z¦5ñ fÒR¯A)^{EŸ»Ê‹^Îé`)eõ®T†6Ê}XË¦éÄ˜Ä~{|	e±SóÂä< ›k*|î§ı-†Æ>R'd>0Émwj¿•NLÓ•l“ä—ÇÖiÄ-õÌ’j¦™)fååts¶1›NZY9Ì"95¥«¨À—î sƒC&qœĞ÷E0bê¸WÈ)ÆüïØ¶v³¶é,H«z³$Ş8ÍLDåÊt£`Å¬‰&B•´k5ƒ,eZ±”Ü´!º	*şIxJØ®çõï“GŸêä•.—µ )sÓ½°p¡ñÆbƒ`¤Ù¢7ˆh¯á„½ş5õWœƒ„sÖgqµCn8Şrµ0‰ƒZH…*7Ü™,6çcÛ¼I»#ÆsÈ×‚A‚Á›Ë£jyòöŸ@'İşÎô5÷½l€Ş•HfdQÊrW(†÷“¡å5v¯î5—§ÙeZwÆ&!inìWİ¢Hcùıû¡%Åò~&»„Ã%õXñ/ğwUpvì”)¨•ÿn#É%ú’4×]®¨©/mëşéÁÏ(¢şàLI™ªV§ŠİÎÌZ
+v³¤”ÍO§;£—ûã	´¢Ş@:Óªñdî=Qâ›‹\Ú(Ij…şæ[]un³0à£ƒ]/À/@È”ñ6¡ç!ït§èêyYˆ4¹¥Ü¢¬©0z”‘şñ‡rmµQPcu”1±ıá@h~áCnèhXÔÜá>°$ıÕ?ùé¾üõòÛ¿yõ çşöúÿqˆ$ŒÍV‰~ü…¿®57©Ì0¼CzmóuwzŸÿ½3G6‘fRĞ#ÜYŠ*T´; eÊq¿V-B²h‘:X•w×nU›’YÎAñ‘Õq!²ßcÉÚ8¥Şd^"‘kå7é^%}®PûÙ¼:|”‰
+Dä|1Æ–1™Íq‰TÕ€ŠnO¿~òäÉÓ—ÍäĞ”¸O
+I=Ÿ±ÂƒÁ;Œk\6NÏI|*uªÊÃ!«{º%w7¿lO÷æ{gƒ‘lêŠcÖUÓs¨á ”Ø«3MJ+şp„òÌÁÅæ')È º4¦«C2­ø¬ş¤|½M¯ß™}óé{O;ªõYİCâ§îäÂe©İšü‘0ï[¸smmJÖıæîç}Gücğ„ï‡O~únğó_ÿôwÿ÷ë»éOıû»Áïügj"ƒ…¯Ë%+ ºøŠ£Ğ€Tø´_ü’€{SíÅioG‘"
+n·³¨#Ğôô6¸‚%ÇoÎÔ·.3MÏâçSÇ	dÍòˆúW:ÑêáêšDÙ£÷œìúĞİà	d–a°³0X[õ+ò÷Xz„¾¾:#`DÁŸ#áB¬­P§)Kï‚TÎãåªwvwtÙ©6f[î“æC"hq İgé'p+‰‹¦ˆĞ?ıKÿŠ
+*d±xÃdz^¡/6A²Ø±hñşö^åv¸†€é‘¦Y.+Èj­t1´ÅNG¨õNWK˜'Òš ”~ÙçOİ‹.Ü¢!¹ËÄ®óèúô\íÃTİâäÓ­ü#[Kì[ºÿ¤a0Uäh6a,)œQkÇO
+xbÁÍw?x!õuç’Ÿ)1L
+ÄÑĞx ÿ<a«jƒòË]Ó¾Í“¿ï{ÒwU))¡ŠfòÒn:iØş¯RZºî!Ïhuøşâl•âÿ‘‡Ç”úVÊh®8’.ˆ¶.ĞeS]^Ÿ+á‘]Â¤Ü?”$(«ÑV²´Úóåâ…˜‡„<iÓÕ®$¡ME ®ÒõbĞŠ5A<éV÷NƒÕåQtÜUúPy%Ö¬#yX`3)3{S±K^’CE05v’õFÁX Ú^- -áâ²:}"	ƒœà†¸<òş€¨£iìŞÀ•åä£Ùİ­J.–N«‚oHX;™7'×æøÕÑ¤»Í1R!å“6—ÂTPIy{µ0gV–Nñ\Â•¡SÏ¤JA:&\OHüµŸ MrÛÒô[ Ä£VÄ¤Æ·?À”Í7#®ù‰©ì0”ì¯ğÔ»(+[—ÖËÕP*§‰G–ÉØÚ¢ÏÛ“ÊŒ~¬¦#G˜îÆMD•P1†“äøí'«Úç«¬U¦
+øª ¡çÏX €–Î’»¸çø´:ÃÉGÏÑE7LÅ>°¤DÅqÃ·ç\úDonRßrU¸øåÑ{;4½¸Ú¥ï„ıüPq,Y!œ°¨5ŠâEÂ_JÎ$SMBšøŠ©š¸Jxî"«‡¨0bpîÓ•¢ù¦üÜ-ş *Ø—5ïÃ°Á"vl)Xt1Õş•ç#ÖÁV®Ó£h‡q!nólÁU)MÓozÊ@§`¶€Á˜ÃVP_›ÕÍÙ–«,fä"Ñ‡3ùAÖ « RgoĞZÄö<• ‹Ëˆáfuæ^‰ŒÅu€Ùk £:Ãy"£—‡?ıjh,™„W,¨¡"±Ê(eÕÄ¶İ¢?=j/6îÎÿâ¦ª_†?S[¼˜#Ò1e;	ö³NÁ.êZS‘ÈNîüNÈ-‘(ÕºoX# }T’T€£»I÷Ÿ>¨L$xÁæ£eòí6Ïì"ªğ¹ÒUø»²™HØh¨ZdãÚÇÌ&ìÆ=Œ/Æıæ-mgcD£¿ê”·7F¹1|ÍaóéV5ßŸïMvÆµR“NkQÇ—ÂqON-¢°hÛ w¸CƒóÍò~8Œª(†$V×GDPê±k#9Z«¥Uåõ– gUp<¸°º{V®ğ“øz*?ê“?R­†ìä¡n<ÿ f½Ãäu5vÖnN—:%/O“Ûô_ãŠ$u_¥2O>ÙAŒ‚ÅEA™¾aƒáÂ¸‹'`·‚›˜Š¥½”mtÀ…õÍ¡ßïêú¤VÂ'-éLå’RÓ5‹bC·«hP£Û¢Æ\=Ô½˜ğK[–ŞUƒŸk@¤s¿ŸQá$Y9ºÚ—¦³fT„ckÿõ³ı&sFğO›í0MÂ'ÔÏäÿ¸!ç\¢€œ79£ç°ô¨ÃX{¯fn¾4`Ï<vt…ƒM¥Ö»×áÅ0?ƒ„Ö÷µ?zÿ÷´Ö¼AûÔj3Şc+\Æ¸—»ó…\>±"îÙõ»v®›áI„L|ÎèØ1“-0‡$üy(Ÿ”ÀÀ­xÄKÙŸÏ˜bè?í¡Ïg^Ê²ıvóÀ¾X:€!Õ.;ƒy&U¢@¤gÅ×ûá=Ö-ğõóùÿ¬™ˆ<[l_Ò`ƒÑŞİö=˜ËãÈ(ø†é{E¢RËöŠxÔ¢¬7D ÁP·—óÉ6ÚÌ”ôŞù:` áÊ›HûÛ¢	<6?c/™@xŞ~>=OÒˆL'äN”ä!×)’—]H¦ø¨î4Ñ<ÃµkY¯)ˆc¹ªJ5‘,H×D)»éÇ§ !¤8ÏhLªŠöğŠ²Èœí˜B-!|·­	ûÀc¯ƒÓÃšñÊßL¡Kp–(ÙubVùc³bÓqˆ,¾éötaœ²!ûÜÉ,é=°V@`âTÿs{O*åÊşÎîü_ôm“Ur/ÜGÙão¢ÎëP¡Û;cãô¤ #V>]J<(Ù‚^6ä‡7'LÄ¹Æ¶éÇ:pàl‡¿¥~ÏJ´¬¾Œ¤¶ât0ÚAQŠ)@Ma‚İy„¢ä¿üüûYH~†Ë);,ÀÙQÿ| âù±—»;[àÑ¿ âÔVÌ[X?Ï³ÕæşsMÉ\öŞf;‰Ç^NF»rbÕ²¤€ã=15 ‚¢³é‹§[O&A—$Iî[ ]C¬É¤Z}‘T~$äHÉ\¦jñĞøLG±”~<U{/µåÙpÛ¶Ä«	]s£EZjú¦’·–ÈwÊWş#µ-–6Ul“ıÙt¹şi#j±×E[ˆÅ3ãcó}¿¹»Xìn7v^1q9.ïÚù³¿5^¹1¥ªw‘ ı Fäzm€íÛMò9>q-€m^êŸ{8ë
+şlIŠlÀ.MmòH›Cš„¥É¼b£“Á”?ÔÏ[Ö÷wŞİ‰x‰>:÷íŸŒÍŸdÄ	¶’·;ÀeQ øµ8Ç<Ç“$È–Wcxannq™ê«ğ·š—3qw¾š’&½¿3JëËÖßõ­6_2ŞÃs^Ğ)şù F¸Ó{„nkIñßÏı¨ìOtIv·[Âbª¹‡ äRk®^‚ºc·äŠÖ¨Äø4¥Ğe?Äìb‡Z-kéeÓˆ„—ÓAL¾‘’µÚïcÉØkñ%§Gˆ‘0k8“B–òI’L„$ºî‹µˆÂX4öv-ÁàOG8g?¡µ(ùï	ç¶uIôIåc¤ôŸ‘7=†Äñõ9I%§Ø¹xõÄ:˜Q Ôï“PæRºY‡f÷šÇŒvòpÓ¦”â˜,¤8a$,4îĞÒ¾h‘Jr©Ÿ2!ÖMcã‚åiÜ*HUçqs9=\È¥¤lØÚ[‚˜:§#üóç1d¡‡°‚ÚŸ%"w¥@ínïáóU®HÁYâß’»j±™ÅĞÆlû²ŸéxOés£ôÌ³ÆDi²Øâ/ö$ŸÁ\%«íÒÑ¨ÀÂ…*?ãıÇÈ^"Hÿ,®øtŸoˆñZGAû–Òé½Å¹oäHŠ|²ÑîşÎ¢ lÌh·khLaÏüê«5/(‡'}C>¼ÅP'Më½c^ÌØä_3Ëàï^œ¢­¶ô®ã³Ğ–¬…ÉİÛ…Ò’ÁÄ§?|™(ÇlqzLç›ÄR8b	îçšP²…9)£æ(ÛÒiiÓ=ª…œƒ/}–¦­wÙò~{WKs~P³‰ˆº¨uXh¾vè¡·ôk9={y¥§HjabGíjIŠÏ`µ&OB~ÿ:;­[i™o·_´ úKÖQ¤Íš|A…6“ê…@ÿF \æ
