@@ -1,16 +1,44 @@
 workflows:
   unity-ios-build:
     name: Build and Publish iOS from Unity-generated Xcode project
+    # 只在明確需要測試 Codemagic 時觸發，避免干擾 Xcode Cloud
+    branch_pattern: 
+      - "test/codemagic/*"  # 更明確的測試分支
+    tag_pattern: 
+      - "codemagic-test-*"  # 明確的測試標籤
     environment:
       xcode: latest
       cocoapods: default
       vars:
-        XCODE_PROJECT_PATH: "MyUnityiOSApp/MyUnityiOSApp.xcodeproj"
+        XCODE_PROJECT_PATH: "WGPerformanceCalculator/WGPerformanceCalculator.xcodeproj"
         XCODE_SCHEME: "Unity-iPhone"
     scripts:
+      - name: Check build environment
+        script: |
+          # 檢查必要目錄是否存在
+          if [ ! -d "$CM_BUILD_DIR/WGPerformanceCalculator" ]; then
+            echo "Error: WGPerformanceCalculator directory not found"
+            exit 1
+          fi
+          
+          if [ ! -f "$XCODE_PROJECT_PATH" ]; then
+            echo "Error: Xcode project not found at $XCODE_PROJECT_PATH"
+            exit 1
+          fi
+          
+          # 建立建置目錄
+          mkdir -p "$CM_BUILD_DIR/build"
+          mkdir -p "$CM_BUILD_DIR/build/ipa"
+          
+          # 檢查 exportOptions.plist
+          if [ ! -f "exportOptions.plist" ]; then
+            echo "Error: exportOptions.plist not found"
+            exit 1
+          fi
+
       - name: Install CocoaPods dependencies (optional)
         script: |
-          cd $CM_BUILD_DIR/MyUnityiOSApp
+          cd $CM_BUILD_DIR/WGPerformanceCalculator
           pod install || echo "No Podfile found, skipping"
 
       - name: Build Xcode project
@@ -18,14 +46,14 @@ workflows:
           xcodebuild clean -project "$XCODE_PROJECT_PATH" -scheme "$XCODE_SCHEME" -configuration Release
           xcodebuild archive -project "$XCODE_PROJECT_PATH" \
             -scheme "$XCODE_SCHEME" \
-            -archivePath "$CM_BUILD_DIR/build/MyUnityApp.xcarchive" \
+            -archivePath "$CM_BUILD_DIR/build/WGPerformanceCalculator.xcarchive" \
             -configuration Release \
             -destination "generic/platform=iOS"
 
       - name: Export IPA
         script: |
           xcodebuild -exportArchive \
-            -archivePath "$CM_BUILD_DIR/build/MyUnityApp.xcarchive" \
+            -archivePath "$CM_BUILD_DIR/build/WGPerformanceCalculator.xcarchive" \
             -exportOptionsPlist exportOptions.plist \
             -exportPath "$CM_BUILD_DIR/build/ipa"
 
@@ -35,4 +63,4 @@ workflows:
     publishing:
       app_store_connect:
         apple_id: $APP_STORE_ID
-        app_specific_password: $APP_STORE_PASSWORD
+        app_specific_password: $WGPC_PASSWORD
